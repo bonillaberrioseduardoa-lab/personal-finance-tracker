@@ -1,4 +1,4 @@
-from pathlib import Path
+
 
 code = r'''import streamlit as st
 import pandas as pd
@@ -472,6 +472,3 @@ elif menu == "History":
         )
 '''
 
-path = Path("/mnt/data/app_streamlit_stable.py")
-path.write_text(code, encoding="utf-8")
-print(path)
