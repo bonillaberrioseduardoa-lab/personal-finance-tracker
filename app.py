@@ -21,18 +21,15 @@ SCOPES = [
 
 @st.cache_resource
 def connect_to_google_sheet():
-    creds = Credentials.from_service_account_file(
-    "able-yew-499012-q9-0b57020fb3fb.json",
-    scopes=SCOPES
-)
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES
+    )
+
     client = gspread.authorize(creds)
     spreadsheet = client.open(SHEET_NAME)
     return spreadsheet
 
-creds = Credentials.from_service_account_file(
-    "able-yew-499012-q9-0b57020fb3fb.json",
-    scopes=SCOPES
-)
 
 def get_worksheet(sheet, name):
     return sheet.worksheet(name)
