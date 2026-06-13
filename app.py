@@ -1,4 +1,6 @@
-import streamlit as st
+from pathlib import Path
+
+code = """import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -67,13 +69,25 @@ def get_or_create_worksheet(spreadsheet, name, headers):
     return ws
 
 
-def load_data(ws):
+sheet = connect_to_google_sheet()
+
+transactions_ws = get_or_create_worksheet(sheet, "Transactions", TRANSACTION_HEADERS)
+fixed_ws = get_or_create_worksheet(sheet, "Fixed Expenses", FIXED_HEADERS)
+categories_ws = get_or_create_worksheet(sheet, "Categories", CATEGORY_HEADERS)
+budgets_ws = get_or_create_worksheet(sheet, "Budgets", BUDGET_HEADERS)
+goals_ws = get_or_create_worksheet(sheet, "Savings Goals", GOAL_HEADERS)
+
+
+@st.cache_data(ttl=60)
+def load_data_by_sheet(sheet_name):
+    ws = sheet.worksheet(sheet_name)
     records = ws.get_all_records()
     return pd.DataFrame(records)
 
 
 def append_row(ws, row):
     ws.append_row(row)
+    st.cache_data.clear()
 
 
 def format_money(value):
@@ -84,27 +98,41 @@ def prepare_transactions(df):
     if df.empty:
         return df
 
+    expected_cols = TRANSACTION_HEADERS
+
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = ""
+
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
     df["Month Label"] = df["Date"].dt.strftime("%Y-%m")
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
+
     return df
 
 
-sheet = connect_to_google_sheet()
+def prepare_money_column(df, column):
+    if df.empty or column not in df.columns:
+        return df
+    df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+    return df
 
-transactions_ws = get_or_create_worksheet(sheet, "Transactions", TRANSACTION_HEADERS)
-fixed_ws = get_or_create_worksheet(sheet, "Fixed Expenses", FIXED_HEADERS)
-categories_ws = get_or_create_worksheet(sheet, "Categories", CATEGORY_HEADERS)
-budgets_ws = get_or_create_worksheet(sheet, "Budgets", BUDGET_HEADERS)
-goals_ws = get_or_create_worksheet(sheet, "Savings Goals", GOAL_HEADERS)
 
-transactions_df = prepare_transactions(load_data(transactions_ws))
-fixed_df = load_data(fixed_ws)
-categories_df = load_data(categories_ws)
-budgets_df = load_data(budgets_ws)
-goals_df = load_data(goals_ws)
+def safe_categories(df, transaction_type):
+    if df.empty or "Type" not in df.columns or "Category" not in df.columns:
+        return ["Other"]
+
+    cats = df[df["Type"] == transaction_type]["Category"].dropna().tolist()
+    return cats if cats else ["Other"]
+
+
+transactions_df = prepare_transactions(load_data_by_sheet("Transactions"))
+fixed_df = prepare_money_column(load_data_by_sheet("Fixed Expenses"), "Amount")
+categories_df = load_data_by_sheet("Categories")
+budgets_df = prepare_money_column(load_data_by_sheet("Budgets"), "Budget Amount")
+goals_df = load_data_by_sheet("Savings Goals")
 
 st.sidebar.title("💰 Finance Tracker Pro")
 
@@ -120,8 +148,6 @@ menu = st.sidebar.radio(
         "History"
     ]
 )
-
-# ================= DASHBOARD =================
 
 if menu == "Dashboard":
     st.title("📊 Executive Financial Dashboard")
@@ -143,18 +169,15 @@ if menu == "Dashboard":
         income = month_df[month_df["Type"] == "Income"]["Amount"].sum()
         expenses = month_df[month_df["Type"] == "Expense"]["Amount"].sum()
         balance = income - expenses
-
         savings_rate = (balance / income * 100) if income > 0 else 0
 
         fixed_total = 0
-        if not fixed_df.empty:
-            fixed_df["Amount"] = pd.to_numeric(fixed_df["Amount"], errors="coerce").fillna(0)
+        if not fixed_df.empty and "Active" in fixed_df.columns:
             fixed_total = fixed_df[fixed_df["Active"] == "Yes"]["Amount"].sum()
 
-        variable_expenses = expenses - fixed_total
+        variable_expenses = max(expenses - fixed_total, 0)
 
         col1, col2, col3, col4, col5 = st.columns(5)
-
         col1.metric("Income", format_money(income))
         col2.metric("Expenses", format_money(expenses))
         col3.metric("Balance", format_money(balance))
@@ -196,6 +219,14 @@ if menu == "Dashboard":
                 )
                 st.plotly_chart(fig_pie, use_container_width=True)
 
+            st.subheader("Fixed vs Variable Expenses")
+            fv_df = pd.DataFrame({
+                "Type": ["Fixed Expenses", "Variable Expenses"],
+                "Amount": [fixed_total, variable_expenses]
+            })
+            fig_fv = px.pie(fv_df, names="Type", values="Amount", title="Fixed vs Variable")
+            st.plotly_chart(fig_fv, use_container_width=True)
+
         st.subheader("Daily Cash Flow")
 
         daily_summary = (
@@ -221,77 +252,65 @@ if menu == "Dashboard":
             use_container_width=True
         )
 
-# ================= ADD TRANSACTION =================
-
 elif menu == "Add Transaction":
     st.title("➕ Add Income or Expense")
 
-    if categories_df.empty:
-        st.warning("Please add categories in the Google Sheet first.")
-    else:
-        with st.form("transaction_form"):
-            trans_date = st.date_input("Date", date.today())
+    with st.form("transaction_form"):
+        trans_date = st.date_input("Date", date.today())
+        trans_type = st.selectbox("Type", ["Expense", "Income"])
 
-            trans_type = st.selectbox("Type", ["Expense", "Income"])
+        category = st.selectbox(
+            "Category",
+            safe_categories(categories_df, trans_type)
+        )
 
-            filtered_categories = categories_df[
-                categories_df["Type"] == trans_type
-            ]["Category"].tolist()
+        amount = st.number_input(
+            "Amount",
+            min_value=0.01,
+            step=0.01,
+            format="%.2f"
+        )
 
-            if not filtered_categories:
-                filtered_categories = ["Other"]
+        description = st.text_input("Description")
 
-            category = st.selectbox("Category", filtered_categories)
+        payment_method = st.selectbox(
+            "Payment Method",
+            [
+                "Cash",
+                "Debit Card",
+                "Credit Card",
+                "ATH Móvil",
+                "Bank Transfer",
+                "Other"
+            ]
+        )
 
-            amount = st.number_input(
-                "Amount",
-                min_value=0.01,
-                step=0.01,
-                format="%.2f"
-            )
+        submitted = st.form_submit_button("Save Transaction")
 
-            description = st.text_input("Description")
+        if submitted:
+            transaction_id = str(uuid.uuid4())[:8]
+            month = trans_date.month
+            year = trans_date.year
+            month_label = trans_date.strftime("%Y-%m")
+            submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            payment_method = st.selectbox(
-                "Payment Method",
-                [
-                    "Cash",
-                    "Debit Card",
-                    "Credit Card",
-                    "ATH Móvil",
-                    "Bank Transfer",
-                    "Other"
-                ]
-            )
+            new_transaction = [
+                transaction_id,
+                str(trans_date),
+                trans_type,
+                category,
+                float(amount),
+                description,
+                payment_method,
+                month,
+                year,
+                month_label,
+                submitted_at
+            ]
 
-            submitted = st.form_submit_button("Save Transaction")
-
-            if submitted:
-                transaction_id = str(uuid.uuid4())[:8]
-                month = trans_date.month
-                year = trans_date.year
-                month_label = trans_date.strftime("%Y-%m")
-                submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                new_transaction = [
-                    transaction_id,
-                    str(trans_date),
-                    trans_type,
-                    category,
-                    float(amount),
-                    description,
-                    payment_method,
-                    month,
-                    year,
-                    month_label,
-                    submitted_at
-                ]
-
-                append_row(transactions_ws, new_transaction)
-
-                st.success("Transaction saved successfully!")
-
-# ================= FIXED EXPENSES =================
+            append_row(transactions_ws, new_transaction)
+            st.success("Transaction saved successfully!")
+            st.rerun()
 
 elif menu == "Fixed Expenses":
     st.title("📌 Fixed Monthly Expenses")
@@ -312,9 +331,7 @@ elif menu == "Fixed Expenses":
         )
 
         due_day = st.number_input("Due Day", min_value=1, max_value=31, step=1)
-
         active = st.selectbox("Active", ["Yes", "No"])
-
         notes = st.text_area("Notes")
 
         submitted = st.form_submit_button("Save Fixed Expense")
@@ -338,18 +355,17 @@ elif menu == "Fixed Expenses":
             )
 
             st.success("Fixed expense saved successfully!")
+            st.rerun()
 
     st.divider()
     st.subheader("Current Fixed Expenses")
 
-    fixed_df = load_data(fixed_ws)
+    fixed_current_df = load_data_by_sheet("Fixed Expenses")
 
-    if fixed_df.empty:
+    if fixed_current_df.empty:
         st.info("No fixed expenses registered yet.")
     else:
-        st.dataframe(fixed_df, use_container_width=True)
-
-# ================= BUDGETS =================
+        st.dataframe(fixed_current_df, use_container_width=True)
 
 elif menu == "Budgets":
     st.title("🎯 Monthly Budgets")
@@ -360,8 +376,7 @@ elif menu == "Budgets":
         month_label = st.text_input("Month", value=current_month)
         category = st.selectbox(
             "Category",
-            categories_df[categories_df["Type"] == "Expense"]["Category"].tolist()
-            if not categories_df.empty else ["Other"]
+            safe_categories(categories_df, "Expense")
         )
 
         budget_amount = st.number_input(
@@ -389,28 +404,23 @@ elif menu == "Budgets":
             )
 
             st.success("Budget saved successfully!")
+            st.rerun()
 
     st.divider()
-
     st.subheader("Budget Performance")
 
-    budgets_df = load_data(budgets_ws)
+    budgets_current_df = prepare_money_column(load_data_by_sheet("Budgets"), "Budget Amount")
 
-    if budgets_df.empty or transactions_df.empty:
+    if budgets_current_df.empty or transactions_df.empty:
         st.info("No budget comparison available yet.")
     else:
-        budgets_df["Budget Amount"] = pd.to_numeric(
-            budgets_df["Budget Amount"],
-            errors="coerce"
-        ).fillna(0)
-
         selected_budget_month = st.selectbox(
             "Select Budget Month",
-            sorted(budgets_df["Month Label"].unique(), reverse=True)
+            sorted(budgets_current_df["Month Label"].dropna().unique(), reverse=True)
         )
 
-        budget_month_df = budgets_df[
-            budgets_df["Month Label"] == selected_budget_month
+        budget_month_df = budgets_current_df[
+            budgets_current_df["Month Label"] == selected_budget_month
         ]
 
         spent_df = transactions_df[
@@ -450,8 +460,6 @@ elif menu == "Budgets":
         )
 
         st.plotly_chart(fig_budget, use_container_width=True)
-
-# ================= SAVINGS GOALS =================
 
 elif menu == "Savings Goals":
     st.title("🏦 Savings Goals")
@@ -493,40 +501,40 @@ elif menu == "Savings Goals":
             )
 
             st.success("Savings goal saved successfully!")
+            st.rerun()
 
     st.divider()
 
-    goals_df = load_data(goals_ws)
+    goals_current_df = load_data_by_sheet("Savings Goals")
 
-    if goals_df.empty:
+    if goals_current_df.empty:
         st.info("No savings goals registered yet.")
     else:
-        goals_df["Target Amount"] = pd.to_numeric(
-            goals_df["Target Amount"],
+        goals_current_df["Target Amount"] = pd.to_numeric(
+            goals_current_df["Target Amount"],
             errors="coerce"
         ).fillna(0)
 
-        goals_df["Current Amount"] = pd.to_numeric(
-            goals_df["Current Amount"],
+        goals_current_df["Current Amount"] = pd.to_numeric(
+            goals_current_df["Current Amount"],
             errors="coerce"
         ).fillna(0)
 
-        goals_df["Progress %"] = (
-            goals_df["Current Amount"] / goals_df["Target Amount"] * 100
+        goals_current_df["Progress %"] = (
+            goals_current_df["Current Amount"] / goals_current_df["Target Amount"] * 100
         ).round(1)
 
-        st.dataframe(goals_df, use_container_width=True)
+        st.dataframe(goals_current_df, use_container_width=True)
 
-        for _, row in goals_df.iterrows():
+        for _, row in goals_current_df.iterrows():
             st.subheader(row["Goal Name"])
-            st.progress(min(row["Progress %"] / 100, 1.0))
+            progress = min(row["Progress %"] / 100, 1.0) if row["Target Amount"] > 0 else 0
+            st.progress(progress)
             st.write(
                 f"{format_money(row['Current Amount'])} of "
                 f"{format_money(row['Target Amount'])} "
                 f"({row['Progress %']}%)"
             )
-
-# ================= ANALYTICS =================
 
 elif menu == "Analytics":
     st.title("📈 Financial Analytics")
@@ -553,6 +561,10 @@ elif menu == "Analytics":
             pivot_summary["Expense"] = 0
 
         pivot_summary["Balance"] = pivot_summary["Income"] - pivot_summary["Expense"]
+        pivot_summary["Savings Rate %"] = (
+            pivot_summary["Balance"] / pivot_summary["Income"].replace(0, pd.NA) * 100
+        ).fillna(0).round(1)
+
         pivot_summary = pivot_summary.reset_index()
 
         st.subheader("Monthly Income, Expenses, and Balance")
@@ -607,14 +619,12 @@ elif menu == "Analytics":
 
         st.plotly_chart(fig_top, use_container_width=True)
 
-# ================= HISTORY =================
-
 elif menu == "History":
     st.title("📚 Transaction History")
 
-    transactions_df = prepare_transactions(load_data(transactions_ws))
+    transactions_current_df = prepare_transactions(load_data_by_sheet("Transactions"))
 
-    if transactions_df.empty:
+    if transactions_current_df.empty:
         st.info("No transactions registered yet.")
     else:
         c1, c2, c3 = st.columns(3)
@@ -624,7 +634,7 @@ elif menu == "History":
         month_filter = c2.selectbox(
             "Month",
             ["All"] + sorted(
-                transactions_df["Month Label"].dropna().unique(),
+                transactions_current_df["Month Label"].dropna().unique(),
                 reverse=True
             )
         )
@@ -632,11 +642,11 @@ elif menu == "History":
         category_filter = c3.selectbox(
             "Category",
             ["All"] + sorted(
-                transactions_df["Category"].dropna().unique()
+                transactions_current_df["Category"].dropna().unique()
             )
         )
 
-        filtered_df = transactions_df.copy()
+        filtered_df = transactions_current_df.copy()
 
         if type_filter != "All":
             filtered_df = filtered_df[filtered_df["Type"] == type_filter]
@@ -660,3 +670,8 @@ elif menu == "History":
             file_name="personal_finance_transactions.csv",
             mime="text/csv"
         )
+"""
+
+path = Path("/mnt/data/app_fixed.py")
+path.write_text(code, encoding="utf-8")
+print(path)
