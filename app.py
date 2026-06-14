@@ -1,4 +1,4 @@
-from pathlib import Path
+
 
 code = """import streamlit as st
 import pandas as pd
@@ -672,6 +672,3 @@ elif menu == "History":
         )
 """
 
-path = Path("/mnt/data/app.py")
-path.write_text(code, encoding="utf-8")
-print(path)
